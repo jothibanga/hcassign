@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HealthBuddy — Your AI Healthcare Companion</title>
+  <meta name="description" content="HealthBuddy is a privacy-first, static AI healthcare chatbot that chats like a friend, answers health questions, and books appointments." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🩺</text></svg>">
+  <!-- Tailwind CDN (suitable for static hosting). For production, consider compiling classes. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 via CDN (static, no build step required) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <div id="root"></div>
+
+  <script type="module">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    /********************
+     * Utilities
+     ********************/
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kolkata';
+
+    function clsx(...xs){ return xs.filter(Boolean).join(' '); }
+
+    const STORAGE_KEYS = {
+      appointments: 'hb:appointments',
+      settings: 'hb:settings',
+      history: 'hb:history',
+    };
+
+    function load(key, fallback){
+      try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+    }
+    function save(key, value){ localStorage.setItem(key, JSON.stringify(value)); }
+
+    function formatDateTimeLocal(d=new Date()){
+      const pad = n => String(n).padStart(2, '0');
+      const yyyy = d.getFullYear();
+      const mm = pad(d.getMonth()+1);
+      const dd = pad(d.getDate());
+      const hh = pad(d.getHours());
+      const mi = pad(d.getMinutes());
+      return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+    }
+
+    function toICS({ title, description, start, end, timezone, location }){
+      // Generate a minimal ICS file content
+      const uid = 'healthbuddy-' + Math.random().toString(36).slice(2) + '@local';
+      function dt(d){
+        const dt = new Date(d);
+        const yyyy = dt.getUTCFullYear();
+        const mm = String(dt.getUTCMonth()+1).padStart(2,'0');
+        const dd = String(dt.getUTCDate()).padStart(2,'0');
+        const hh = String(dt.getUTCHours()).padStart(2,'0');
+        const mi = String(dt.getUTCMinutes()).padStart(2,'0');
+        const ss = '00';
+        return `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`;
+      }
+      const lines = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//HealthBuddy//EN',
+        'CALSCALE:GREGORIAN',
+        'METHOD:PUBLISH',
+        'BEGIN:VEVENT',
+        `UID:${uid}`,
+        `DTSTAMP:${dt(new Date())}`,
+        `DTSTART:${dt(start)}`,
+        `DTEND:${dt(end)}`,
+        `SUMMARY:${(title||'Appointment').replace(/\n/g,' ')}`,
+        `DESCRIPTION:${(description||'').replace(/\n/g,' ')}`,
+        location ? `LOCATION:${location.replace(/\n/g,' ')}` : '',
+        'END:VEVENT',
+        'END:VCALENDAR'
+      ].filter(Boolean).join('\r\n');
+      return new Blob([lines], { type: 'text/calendar;charset=utf-8' });
+    }
+
+    function gcalLink({ title, description, start, end, location }){
+      function enc(s){ return encodeURIComponent(s || ''); }
+      const toGCalDate = d => new Date(d).toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+      const dates = `${toGCalDate(start)}/${toGCalDate(end)}`;
+      return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${enc(title)}&details=${enc(description)}&location=${enc(location)}&dates=${dates}`;
+    }
+
+    /********************
+     * Local Health Knowledge (compact, non-diagnostic)
+     ********************/
+    const RED_FLAGS = [
+      { kw: ['chest pain','pressure in chest','tightness chest'], msg: 'Chest pain can be serious. If pain is severe, radiating to arm/jaw, or accompanied by sweating, nausea, or shortness of breath, call emergency services immediately.' },
+      { kw: ['shortness of breath','difficulty breathing'], msg: 'Trouble breathing can be an emergency—seek urgent medical care if sudden or severe.' },
+      { kw: ['stroke','face droop','slurred speech','weakness one side','numbness one side'], msg: 'Possible stroke. Call emergency services right now.' },
+      { kw: ['suicidal','kill myself','harm myself'], msg: 'If you feel at risk of harming yourself, please call your local emergency number or a suicide hotline immediately and stay with someone you trust.' },
+      { kw: ['allergic shock','anaphylaxis','throat closing','swollen tongue'], msg: 'Signs of anaphylaxis—use an epinephrine auto-injector if available and seek emergency care immediately.' },
+      { kw: ['pregnant bleeding','vaginal bleeding with pain','ectopic'], msg: 'Concerning pregnancy symptoms—seek urgent obstetric assessment.' },
+      { kw: ['high fever','confusion','stiff neck'], msg: 'High fever with confusion or stiff neck can be serious—seek urgent care.' },
+    ];
+
+    const RECOMMENDATIONS = {
+      hydration: 'Drink water regularly (urine pale yellow is a good sign). Limit sugary drinks; herbal teas can help hydration too.',
+      sleep: 'Aim for 7–9 hours of sleep, keep a consistent schedule, and reduce screen exposure 1 hour before bed.',
+      nutrition: 'Base meals on vegetables, fruits, whole grains, lean proteins, and healthy fats. Limit ultra-processed foods and added sugars.',
+      activity: 'Target 150 minutes of moderate activity weekly (e.g., brisk walking) plus 2 strength sessions.',
+      stress: 'Try 5–10 minutes/day of breathing exercises, journaling, or short walks. Consider CBT-based apps for coping skills.',
+    };
+
+    const MINI_KB = [
+      { tags:['fever','temperature','pyrexia'], answer: 'For mild fever, rest, hydrate, and use paracetamol/acetaminophen per label. Seek care if >39°C, lasting >3 days, accompanied by severe headache, rash, confusion, or breathing difficulty.' },
+      { tags:['cold','sore throat','runny nose'], answer: 'Common colds are viral. Rest, fluids, saline nasal rinses, and honey/lozenges may help. Seek care for high fever, wheeze, chest pain, or symptoms beyond 10–14 days.' },
+      { tags:['diabetes','blood sugar','glucose'], answer: 'For diabetes, focus on consistent meals, carb awareness, physical activity, and monitoring. Discuss targets and medication adjustments with your clinician; do not change doses without advice.' },
+      { tags:['bp','hypertension','blood pressure'], answer: 'For high BP: reduce salt, maintain healthy weight, be active, limit alcohol, manage stress, and take prescribed meds as directed. Home BP monitoring helps assess control.' },
+      { tags:['pcos','polycystic ovary'], answer: 'PCOS care includes balanced diet, physical activity, weight management if applicable, and addressing symptoms (cycle irregularity, acne, hair). See gynecologist/endocrinologist for individualized plan.' },
+      { tags:['mental health','anxiety','depression','stress'], answer: 'You are not alone. Evidence-based steps: regular sleep, routine, sunlight, exercise, social connection, and CBT skills. Seek professional help if symptoms persist or affect daily living.' },
+      { tags:['nutrition','diet','weight'], answer: 'Sustainable approaches beat quick fixes. Emphasize whole foods, protein, fiber, and gradual habit changes. Consider a registered dietitian for personalized guidance.' },
+    ];
+
+    function detectRedFlags(text){
+      const t = text.toLowerCase();
+      const hits = RED_FLAGS.filter(r => r.kw.some(k => t.includes(k)));
+      return hits.map(h => '⚠️ ' + h.msg);
+    }
+
+    function kbAnswer(text){
+      const t = text.toLowerCase();
+      for (const item of MINI_KB){
+        if (item.tags.some(tag => t.includes(tag))) return item.answer;
+      }
+      return null;
+    }
+
+    function generalAdvice(text){
+      // Lightweight heuristic recommender
+      const tips = [];
+      if (/sleep|insomnia|tired|fatigue/i.test(text)) tips.push(RECOMMENDATIONS.sleep);
+      if (/stress|anxiety|overwhelmed|burnout/i.test(text)) tips.push(RECOMMENDATIONS.stress);
+      if (/diet|nutrition|weight|obesity|cholesterol/i.test(text)) tips.push(RECOMMENDATIONS.nutrition);
+      if (/exercise|fitness|activity|steps|walk/i.test(text)) tips.push(RECOMMENDATIONS.activity);
+      if (/dehydr|water|headache|heat/i.test(text)) tips.push(RECOMMENDATIONS.hydration);
+      return tips.length ? 'Here are tailored, non-diagnostic suggestions:\n• ' + tips.join('\n• ') : null;
+    }
+
+    /********************
+     * OpenAI-compatible client (optional)
+     * Works if user supplies an API key in Settings. Otherwise fallback to local logic.
+     ********************/
+    async function aiChat({ apiKey, baseUrl, model, messages }){
+      const url = (baseUrl || 'https://api.openai.com/v1') + '/chat/completions';
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+      };
+      const body = {
+        model: model || 'gpt-4o-mini',
+        temperature: 0.4,
+        messages,
+      };
+      const res = await fetch(url, { method:'POST', headers, body: JSON.stringify(body) });
+      if(!res.ok) throw new Error('API error: ' + res.status);
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content?.trim() || 'Sorry, I could not generate a response.';
+    }
+
+    /********************
+     * Components
+     ********************/
+    function TopBar({ onSettings, onViewAppts }){
+      return (
+        React.createElement('div', { className:'sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-slate-200' },
+          React.createElement('div', { className:'max-w-5xl mx-auto px-4 py-3 flex items-center justify-between' },
+            React.createElement('div', { className:'flex items-center gap-3' },
+              React.createElement('div', { className:'w-9 h-9 rounded-2xl bg-emerald-100 grid place-items-center text-xl' }, '🩺'),
+              React.createElement('div', null,
+                React.createElement('div', { className:'font-semibold text-slate-900' }, 'HealthBuddy'),
+                React.createElement('div', { className:'text-xs text-slate-500' }, 'Friendly, non‑diagnostic health guidance + appointment booking')
+              )
+            ),
+            React.createElement('div', { className:'flex items-center gap-2' },
+              React.createElement('button', { onClick:onViewAppts, className:'px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-sm' }, 'Appointments'),
+              React.createElement('button', { onClick:onSettings, className:'px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm' }, 'Settings')
+            )
+          )
+        )
+      );
+    }
+
+    function Message({ role, content }){
+      const isUser = role === 'user';
+      return (
+        React.createElement('div', { className: clsx('flex gap-3 items-start', isUser ? 'justify-end' : 'justify-start') },
+          !isUser && React.createElement('div', { className:'w-9 h-9 rounded-2xl bg-emerald-100 grid place-items-center' }, '🩺'),
+          React.createElement('div', { className: clsx('max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm', isUser ? 'bg-emerald-600 text-white rounded-br-sm' : 'bg-white border border-slate-200 rounded-bl-sm') },
+            content.split('\n').map((line, i) => React.createElement('p', { key:i, className: clsx(i>0 && 'mt-2') }, line))
+          ),
+          isUser && React.createElement('div', { className:'w-9 h-9 rounded-2xl bg-sky-100 grid place-items-center' }, '🧑')
+        )
+      );
+    }
+
+    function ChatInput({ onSend, disabled }){
+      const [text, setText] = useState('');
+      const onKey = (e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); handleSend(); } };
+      function handleSend(){ const t = text.trim(); if(!t) return; onSend(t); setText(''); }
+      return (
+        React.createElement('div', { className:'p-3 border-t bg-white/80 backdrop-blur sticky bottom-0' },
+          React.createElement('div', { className:'max-w-5xl mx-auto flex items-end gap-2' },
+            React.createElement('textarea', { value:text, onChange:e=>setText(e.target.value), onKeyDown:onKey, rows:1, placeholder:'Ask about symptoms, medications, wellness, or say "book appointment"…', className:'flex-1 resize-none rounded-2xl border border-slate-300 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400', disabled }),
+            React.createElement('button', { onClick:handleSend, disabled, className: clsx('px-4 py-3 rounded-2xl text-sm font-medium', disabled ? 'bg-slate-200 text-slate-500' : 'bg-emerald-600 hover:bg-emerald-700 text-white') }, 'Send')
+          )
+        )
+      );
+    }
+
+    function SettingsModal({ open, onClose, settings, onSave }){
+      const [local, setLocal] = useState(settings);
+      useEffect(()=>{ setLocal(settings); }, [open]);
+      if(!open) return null;
+      return (
+        React.createElement('div', { className:'fixed inset-0 z-40 bg-black/30 grid place-items-center p-4' },
+          React.createElement('div', { className:'w-full max-w-2xl rounded-2xl bg-white p-5 shadow-xl border' },
+            React.createElement('div', { className:'flex items-center justify-between mb-3' },
+              React.createElement('h2', { className:'text-lg font-semibold' }, 'Settings'),
+              React.createElement('button', { onClick:onClose, className:'text-slate-600' }, '✕')
+            ),
+            React.createElement('div', { className:'grid gap-4' },
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'OpenAI‑compatible API Base URL (optional)'),
+                React.createElement('input', { className:'w-full border rounded-xl px-3 py-2', placeholder:'https://api.openai.com/v1', value:local.baseUrl||'', onChange:e=>setLocal({...local, baseUrl:e.target.value}) })
+              ),
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'API Key (stored locally)'),
+                React.createElement('input', { className:'w-full border rounded-xl px-3 py-2', type:'password', placeholder:'sk-...', value:local.apiKey||'', onChange:e=>setLocal({...local, apiKey:e.target.value}) })
+              ),
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Model (e.g., gpt-4o-mini)'),
+                React.createElement('input', { className:'w-full border rounded-xl px-3 py-2', placeholder:'gpt-4o-mini', value:local.model||'', onChange:e=>setLocal({...local, model:e.target.value}) })
+              ),
+              React.createElement('div', { className:'text-xs text-slate-500' }, 'Your key is saved only in your browser (localStorage). Calls are made from your device directly to the selected API. For privacy, avoid sharing sensitive personal data.')
+            ),
+            React.createElement('div', { className:'mt-4 flex justify-end gap-2' },
+              React.createElement('button', { className:'px-3 py-2 rounded-xl bg-slate-100', onClick:onClose }, 'Cancel'),
+              React.createElement('button', { className:'px-3 py-2 rounded-xl bg-emerald-600 text-white', onClick:()=>{ onSave(local); onClose(); } }, 'Save')
+            )
+          )
+        )
+      );
+    }
+
+    function AppointmentModal({ open, onClose, onBook, presetReason }){
+      const [name, setName] = useState('');
+      const [reason, setReason] = useState(presetReason || 'Consultation');
+      const [location, setLocation] = useState('Clinic Visit');
+      const [start, setStart] = useState(formatDateTimeLocal(new Date(Date.now()+ 2*60*60*1000)));
+      const [durationMins, setDurationMins] = useState(30);
+      if(!open) return null;
+      function submit(){
+        const startDate = new Date(start);
+        const endDate = new Date(startDate.getTime() + durationMins*60000);
+        const apt = { id: crypto.randomUUID(), name, reason, location, start: startDate.toISOString(), end: endDate.toISOString(), tz };
+        onBook(apt);
+        onClose();
+      }
+      return (
+        React.createElement('div', { className:'fixed inset-0 z-40 bg-black/30 grid place-items-center p-4' },
+          React.createElement('div', { className:'w-full max-w-xl rounded-2xl bg-white p-5 shadow-xl border' },
+            React.createElement('div', { className:'flex items-center justify-between mb-3' },
+              React.createElement('h2', { className:'text-lg font-semibold' }, 'Book an Appointment'),
+              React.createElement('button', { onClick:onClose, className:'text-slate-600' }, '✕')
+            ),
+            React.createElement('div', { className:'grid gap-3' },
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Your Name (for the booking)'),
+                React.createElement('input', { className:'w-full border rounded-xl px-3 py-2', value:name, onChange:e=>setName(e.target.value), placeholder:'e.g., Aishwarya' })
+              ),
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Reason'),
+                React.createElement('input', { className:'w-full border rounded-xl px-3 py-2', value:reason, onChange:e=>setReason(e.target.value), placeholder:'e.g., Fever, general checkup' })
+              ),
+              React.createElement('div', null,
+                React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Location / Mode'),
+                React.createElement('select', { className:'w-full border rounded-xl px-3 py-2', value:location, onChange:e=>setLocation(e.target.value) },
+                  React.createElement('option', { value:'Clinic Visit' }, 'Clinic Visit'),
+                  React.createElement('option', { value:'Video Consult' }, 'Video Consult'),
+                  React.createElement('option', { value:'Phone Call' }, 'Phone Call')
+                )
+              ),
+              React.createElement('div', { className:'grid sm:grid-cols-2 gap-3' },
+                React.createElement('div', null,
+                  React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Start Time'),
+                  React.createElement('input', { type:'datetime-local', className:'w-full border rounded-xl px-3 py-2', value:start, onChange:e=>setStart(e.target.value) })
+                ),
+                React.createElement('div', null,
+                  React.createElement('label', { className:'block text-sm font-medium mb-1' }, 'Duration (minutes)'),
+                  React.createElement('input', { type:'number', min:10, step:5, className:'w-full border rounded-xl px-3 py-2', value:durationMins, onChange:e=>setDurationMins(parseInt(e.target.value||'30')) })
+                )
+              ),
+              React.createElement('div', { className:'text-xs text-slate-500' }, `Timezone: ${tz}`)
+            ),
+            React.createElement('div', { className:'mt-4 flex justify-end gap-2' },
+              React.createElement('button', { className:'px-3 py-2 rounded-xl bg-slate-100', onClick:onClose }, 'Cancel'),
+              React.createElement('button', { className:'px-3 py-2 rounded-xl bg-emerald-600 text-white', onClick:submit }, 'Book')
+            )
+          )
+        )
+      );
+    }
+
+    function AppointmentsPanel({ open, onClose, appts, onDelete, onExport }){
+      if(!open) return null;
+      return (
+        React.createElement('div', { className:'fixed inset-0 z-30 bg-black/30 grid place-items-center p-4' },
+          React.createElement('div', { className:'w-full max-w-2xl rounded-2xl bg-white p-5 shadow-xl border' },
+            React.createElement('div', { className:'flex items-center justify-between mb-3' },
+              React.createElement('h2', { className:'text-lg font-semibold' }, 'Your Appointments'),
+              React.createElement('button', { onClick:onClose, className:'text-slate-600' }, '✕')
+            ),
+            appts.length === 0 ? React.createElement('p', { className:'text-sm text-slate-600' }, 'No appointments yet.') :
+            React.createElement('div', { className:'grid gap-3' },
+              appts.map(a => React.createElement('div', { key:a.id, className:'border rounded-xl p-3 flex items-start justify-between' },
+                React.createElement('div', null,
+                  React.createElement('div', { className:'font-medium' }, a.reason || 'Appointment'),
+                  React.createElement('div', { className:'text-sm text-slate-600' }, a.name ? ('With: ' + a.name) : '—'),
+                  React.createElement('div', { className:'text-sm text-slate-600' }, new Date(a.start).toLocaleString([], { dateStyle:'medium', timeStyle:'short' })),
+                  React.createElement('div', { className:'text-xs text-slate-500' }, a.location)
+                ),
+                React.createElement('div', { className:'flex gap-2' },
+                  React.createElement('button', { className:'px-3 py-2 rounded-xl bg-slate-100', onClick:()=>onExport(a) }, 'Export .ics'),
+                  React.createElement('a', { className:'px-3 py-2 rounded-xl bg-emerald-600 text-white', href:gcalLink({ title:a.reason, description:`HealthBuddy appointment with ${a.name||''}`, start:a.start, end:a.end, location:a.location }), target:'_blank', rel:'noreferrer' }, 'Add to Google Calendar'),
+                  React.createElement('button', { className:'px-3 py-2 rounded-xl bg-rose-100 text-rose-700', onClick:()=>onDelete(a.id) }, 'Delete')
+                )
+              ))
+            )
+          )
+        )
+      );
+    }
+
+    function Chat(){
+      const [messages, setMessages] = useState(()=> load(STORAGE_KEYS.history, [
+        { role:'assistant', content: `Hi! I\'m HealthBuddy. I can chat like a friend, answer health questions (non-diagnostic), give practical recommendations, and help you book appointments. How can I help today?` }
+      ]));
+      const [settings, setSettings] = useState(()=> load(STORAGE_KEYS.settings, { baseUrl:'https://api.openai.com/v1', apiKey:'', model:'gpt-4o-mini' }));
+      const [showSettings, setShowSettings] = useState(false);
+      const [showApt, setShowApt] = useState(false);
+      const [presetReason, setPresetReason] = useState('Consultation');
+      const [appts, setAppts] = useState(()=> load(STORAGE_KEYS.appointments, []));
+      const [busy, setBusy] = useState(false);
+      const scroller = useRef(null);
+
+      useEffect(()=>{ save(STORAGE_KEYS.history, messages); }, [messages]);
+      useEffect(()=>{ save(STORAGE_KEYS.settings, settings); }, [settings]);
+      useEffect(()=>{ save(STORAGE_KEYS.appointments, appts); }, [appts]);
+      useEffect(()=>{ scroller.current?.scrollTo({ top: scroller.current.scrollHeight }); }, [messages, busy]);
+
+      function push(role, content){ setMessages(m => [...m, { role, content }]); }
+
+      function intent(text){
+        const t = text.toLowerCase();
+        if (/^(hi|hello|hey)\b/.test(t)) return 'greet';
+        if (/(book|schedule).*(appointment|doctor|visit)|appointment|consult/i.test(t)) return 'book';
+        if (/(help|recommend|advice|what should i do)/i.test(t)) return 'recommend';
+        if (/(emergency|ambulance|er|casualty)/i.test(t)) return 'emergency';
+        return 'health';
+      }
+
+      async function handleSend(text){
+        push('user', text);
+        const i = intent(text);
+        if (i==='greet'){
+          push('assistant', `Hello! I\'m HealthBuddy \u2014 here to chat, answer health questions, and help book appointments. What\'s on your mind?`);
+          return;
+        }
+
+        // Emergency red flags first
+        const flags = detectRedFlags(text);
+        if (flags.length){
+          push('assistant', flags.join('\n') + '\n\nIf you\'re safe and this is not an emergency, I can still share general info or help you book a same/next-day appointment. What would you like to do?');
+          return;
+        }
+
+        if (i==='book'){
+          setPresetReason(text);
+          setShowApt(true);
+          push('assistant', 'I can book that for you. I opened the appointment form — add your details and time, then confirm.');
+          return;
+        }
+
+        // Try remote AI if configured
+        const canAI = settings.apiKey && settings.baseUrl;
+        setBusy(true);
+        try {
+          if (canAI){
+            const sys = {
+              role:'system', content:
+`You are HealthBuddy, a friendly but clinically careful healthcare assistant. You are NOT a doctor and not a substitute for professional care. Provide:\n- empathetic, plain‑language guidance\n- evidence‑aligned self‑care tips\n- when to seek care & red‑flags\n- clear next steps and options (including booking).\nAlways add a brief disclaimer. Keep answers concise but helpful. Timezone: ${tz}.`
+            };
+            const history = messages.map(m=>({ role:m.role, content:m.content })).slice(-10);
+            const reply = await aiChat({ apiKey:settings.apiKey, baseUrl:settings.baseUrl, model:settings.model, messages:[sys, ...history, { role:'user', content:text }] });
+            push('assistant', reply + '\n\n_(General information, not medical advice. For emergencies, call local services.)_');
+          } else {
+            // Local fallback logic (deterministic)
+            const kb = kbAnswer(text);
+            const adv = generalAdvice(text);
+            const rec = [];
+            if (kb) rec.push(kb);
+            if (adv) rec.push(adv);
+            if (!rec.length){
+              rec.push('Here\'s a general plan: 1) Tell me your main symptom(s) and how long they\'ve lasted. 2) Describe any medications, allergies, or conditions. 3) I can suggest self‑care and tell you when to see a clinician.');
+            }
+            rec.push('If you want, I can book an appointment. Just say "book appointment" with a preferred day/time.');
+            push('assistant', rec.join('\n\n') + '\n\n_(General information, not medical advice.)_');
+          }
+        } catch(e){
+          push('assistant', 'I had trouble generating an AI response. You can add an API key in Settings to enable advanced answers, or I can continue with general guidance.');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      function bookAppointment(apt){
+        setAppts(a => [apt, ...a].sort((x,y)=> new Date(x.start)-new Date(y.start)));
+        push('assistant', `Booked: ${apt.reason} on ${new Date(apt.start).toLocaleString([], { dateStyle:'medium', timeStyle:'short' })} (${apt.location}). You can export the calendar invite from Appointments.`);
+      }
+
+      function exportICS(apt){
+        const blob = toICS({ title: apt.reason, description: `HealthBuddy appointment with ${apt.name||''}`, start: apt.start, end: apt.end, timezone: apt.tz, location: apt.location });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = `HealthBuddy-${apt.reason.replace(/\s+/g,'_')}.ics`; a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function deleteApt(id){ setAppts(a => a.filter(x => x.id !== id)); }
+
+      return (
+        React.createElement('div', { className:'min-h-screen flex flex-col' },
+          React.createElement(TopBar, { onSettings:()=>setShowSettings(true), onViewAppts:()=>setPanelOpen(true) }),
+          React.createElement('main', { className:'flex-1' },
+            React.createElement('div', { className:'max-w-5xl mx-auto px-4 py-6' },
+              React.createElement('div', { className:'mb-4 p-4 rounded-2xl bg-emerald-50 border border-emerald-100 text-sm text-emerald-900' },
+                'HealthBuddy gives general guidance only and cannot diagnose. If you are experiencing an emergency, call your local emergency number.'
+              ),
+              React.createElement('div', { ref:scroller, className:'h-[60vh] overflow-y-auto pr-1 space-y-4' },
+                messages.map((m, idx)=> React.createElement(Message, { key:idx, role:m.role, content:m.content }))
+              )
+            )
+          ),
+          React.createElement(ChatInput, { onSend:handleSend, disabled:busy }),
+          React.createElement(SettingsModal, { open:showSettings, onClose:()=>setShowSettings(false), settings, onSave:setSettings }),
+          React.createElement(AppointmentModal, { open:showApt, onClose:()=>setShowApt(false), onBook:bookAppointment, presetReason }),
+          React.createElement(AppointmentsPanel, { open:usePanelOpen(), onClose:()=>setPanelOpen(false), appts, onDelete:deleteApt, onExport:exportICS })
+        )
+      );
+
+      // Little trick to manage the Appointments panel state outside JSX nesting
+      function usePanelOpen(){
+        const [open, setOpen] = useState(false);
+        useEffect(()=>{ window.__setPanelOpen = setOpen; },[]);
+        return open;
+      }
+      function setPanelOpen(v){ window.__setPanelOpen?.(v); }
+    }
+
+    function App(){
+      return (
+        React.createElement('div', null,
+          React.createElement(Chat)
+        )
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(App));
+  </script>
+
+  <footer class="max-w-5xl mx-auto px-4 py-8 text-xs text-slate-500">
+    <div class="border-t pt-4">© <span id="year"></span> HealthBuddy. Educational information only. Not medical advice.</div>
+  </footer>
+  <script>document.getElementById('year').textContent = new Date().getFullYear();</script>
+</body>
+</html>
